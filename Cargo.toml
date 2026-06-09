@@ -1,0 +1,6 @@
+[workspace]
+members = ["coro", "coro-demo"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"

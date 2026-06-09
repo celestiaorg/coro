@@ -1,0 +1,20 @@
+[package]
+name = "coro"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+celestia-client = "1.0.0"
+celestia-grpc = "1.0.0"
+commonware-actor = "2026.5.0"
+commonware-codec = "2026.5.0"
+commonware-cryptography = "2026.5.0"
+commonware-resolver = "2026.5.0"
+commonware-runtime = "2026.5.0"
+commonware-utils = "2026.5.0"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
