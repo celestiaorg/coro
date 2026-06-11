@@ -101,9 +101,12 @@ batch is replica-visible canonical history.
 
 Public APIs:
 
+- `SingleSequencer::archive_ready()`
+- `SingleSequencer::flush_archive()`
 - `SingleSequencer::archived_head()`
 - `SingleSequencer::published_head()`
 - `SingleSequencer::status(sequence)`
+- `SingleSequencer::unpublished_archived_batches()`
 - `SingleSequencer::head()`
 
 `head()` means published head.
@@ -112,6 +115,25 @@ Public APIs:
 
 - `Archived`
 - `Published(BatchCursor)`
+
+`SingleSequencer::process_ready()` and `SingleSequencer::flush()` keep the
+existing compatibility behavior: they archive a batch and publish it before
+returning a `BatchCursor`.
+
+Hosts that want soft confirmations without blocking on DA can use the split
+flow:
+
+```rust
+sequencer.submit(tx).await?;
+let archived = sequencer.archive_ready().await?;
+```
+
+Then a background publisher can materialize canonical history with either:
+
+- `SingleSequencer::publish_archived_sequence(sequence)` when Coro should use
+  its configured `Publisher`, or
+- `SingleSequencer::record_published_cursor(cursor)` when the host published
+  the archived payload with its own DA submission strategy.
 
 ## HTTP Demo Control Plane
 

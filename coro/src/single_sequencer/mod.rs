@@ -371,12 +371,123 @@ where
 
     pub async fn process_ready(&self) -> Result<Option<BatchCursor>, A::Error> {
         let _writer = self.writer.lock().await;
-        self.process_inner(false).await
+        let Some(record) = self.archive_inner(false).await? else {
+            return Ok(None);
+        };
+        self.publish_archive_record(record).await.map(Some)
     }
 
     pub async fn flush(&self) -> Result<Option<BatchCursor>, A::Error> {
         let _writer = self.writer.lock().await;
-        self.process_inner(true).await
+        let Some(record) = self.archive_inner(true).await? else {
+            return Ok(None);
+        };
+        self.publish_archive_record(record).await.map(Some)
+    }
+
+    /// Archives one ready batch without publishing it to DA.
+    ///
+    /// This is the durable local soft-confirmation boundary for single-sequencer
+    /// deployments. Existing ingress is cut according to the configured
+    /// [`BatchPolicy`]. If the policy is not ready yet, this returns `None`.
+    pub async fn archive_ready(&self) -> Result<Option<ArchivedBatch<A::Metadata>>, A::Error> {
+        let _writer = self.writer.lock().await;
+        self.archive_inner(false)
+            .await?
+            .map(|record| record.validate())
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Archives pending ingress immediately without publishing it to DA.
+    pub async fn flush_archive(&self) -> Result<Option<ArchivedBatch<A::Metadata>>, A::Error> {
+        let _writer = self.writer.lock().await;
+        self.archive_inner(true)
+            .await?
+            .map(|record| record.validate())
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Returns archived batches that do not yet have a durable published cursor.
+    pub async fn unpublished_archived_batches(&self) -> Result<Vec<BatchNumber>, A::Error> {
+        self.ensure_initialized().await?;
+        let mut sequences = Vec::new();
+        for record in self.store.archived_batches().await? {
+            let archived = record.validate()?;
+            if archived.blob_ref.is_none()
+                && self.store.load_cursor(archived.sequence).await?.is_none()
+            {
+                sequences.push(archived.sequence);
+            }
+        }
+        Ok(sequences)
+    }
+
+    /// Publishes a previously archived batch and records its canonical cursor.
+    ///
+    /// The operation is idempotent for the same archived payload. It returns
+    /// `None` when the requested sequence is not archived locally.
+    pub async fn publish_archived_sequence(
+        &self,
+        sequence: BatchNumber,
+    ) -> Result<Option<BatchCursor>, A::Error> {
+        let record = {
+            let _writer = self.writer.lock().await;
+            self.ensure_initialized().await?;
+            if let Some(cursor) = self.batch_cursor(sequence).await? {
+                return Ok(Some(cursor));
+            }
+            let Some(record) = self.store.load_archive(sequence).await? else {
+                return Ok(None);
+            };
+            record
+        };
+
+        let receipt = self
+            .publisher
+            .publish(PublishRequest {
+                id: submission_id(record.sequence, record.payload_hash),
+                payload: record.payload.clone(),
+            })
+            .await?;
+        let cursor = BatchCursor {
+            sequence: record.sequence,
+            blob_ref: receipt.blob_ref,
+            payload_hash: record.payload_hash,
+        };
+        self.record_published_cursor(cursor).await
+    }
+
+    /// Records a cursor for an archived batch that was published externally.
+    ///
+    /// This keeps Coro's durable archive/status model authoritative even when a
+    /// host application uses its own DA submission strategy.
+    pub async fn record_published_cursor(
+        &self,
+        cursor: BatchCursor,
+    ) -> Result<Option<BatchCursor>, A::Error> {
+        let _writer = self.writer.lock().await;
+        self.ensure_initialized().await?;
+        if let Some(existing) = self.batch_cursor(cursor.sequence).await? {
+            if existing != cursor {
+                return Err(Error::SubmissionConflict.into());
+            }
+            return Ok(Some(existing));
+        }
+
+        let Some(record) = self.store.load_archive(cursor.sequence).await? else {
+            return Ok(None);
+        };
+        let archived = record.validate()?;
+        if archived.payload_hash != cursor.payload_hash {
+            return Err(Error::SubmissionConflict.into());
+        }
+        self.store.write_cursor(&cursor).await?;
+        self.store
+            .write_archive_blob_ref(cursor.sequence, cursor.blob_ref)
+            .await?;
+        Ok(Some(cursor))
     }
 
     pub async fn recover(&self) -> Result<RecoveryReport, A::Error> {
@@ -401,7 +512,7 @@ where
 
             report.pending_batches.push(archived.sequence);
             report.resumed_batches.push(archived.sequence);
-            let cursor = self.publish_archived(batch).await?;
+            let cursor = self.publish_archive_record(batch).await?;
             report.finalized_batches.push(cursor);
         }
 
@@ -509,7 +620,10 @@ where
         Ok(None)
     }
 
-    async fn process_inner(&self, force: bool) -> Result<Option<BatchCursor>, A::Error> {
+    async fn archive_inner(
+        &self,
+        force: bool,
+    ) -> Result<Option<ArchiveRecord<A::Metadata>>, A::Error> {
         self.ensure_initialized().await?;
         self.prune_replayed_ingress().await?;
 
@@ -552,8 +666,7 @@ where
         self.store.delete_ingress_through(record.last_ingress_position).await?;
         self.state.lock().await.next_sequence = sequence.0.saturating_add(1);
 
-        let cursor = self.publish_archived(record).await?;
-        Ok(Some(cursor))
+        Ok(Some(record))
     }
 
     fn select_batch(
@@ -575,7 +688,8 @@ where
                 break;
             }
             if !selected.is_empty()
-                && total_bytes.saturating_add(record.tx.len()) > self.config.batch_policy.max_payload_bytes
+                && total_bytes.saturating_add(record.tx.len())
+                    > self.config.batch_policy.max_payload_bytes
             {
                 break;
             }
@@ -598,7 +712,10 @@ where
         Ok(Some(BatchCut { records: selected }))
     }
 
-    async fn publish_archived(&self, record: ArchiveRecord<A::Metadata>) -> Result<BatchCursor, A::Error> {
+    async fn publish_archive_record(
+        &self,
+        record: ArchiveRecord<A::Metadata>,
+    ) -> Result<BatchCursor, A::Error> {
         let receipt = self
             .publisher
             .publish(PublishRequest {
@@ -1006,6 +1123,129 @@ mod tests {
             assert!(sequencer.process_ready().await.unwrap().is_none());
             context.sleep(Duration::from_millis(5)).await;
             assert_eq!(sequencer.process_ready().await.unwrap().unwrap().sequence, BatchNumber(0));
+        });
+    }
+
+    #[test]
+    fn archive_ready_does_not_publish() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let context = Arc::new(context);
+            let backend = MockBackend::new();
+            let sequencer = SingleSequencer::from_shared(
+                context.clone(),
+                Publisher::from_shared(context.clone(), backend.clone(), publisher_config()),
+                Reader::from_shared(context, backend, reader_config()),
+                sequencer_config(),
+                TestApp::default(),
+            );
+
+            sequencer.submit(1).await.unwrap();
+            sequencer.submit(2).await.unwrap();
+            let archived = sequencer.archive_ready().await.unwrap().unwrap();
+
+            assert_eq!(archived.sequence, BatchNumber(0));
+            assert_eq!(archived.metadata, TestMetadata { applied: 2 });
+            assert_eq!(sequencer.archived_head().await.unwrap(), Some(BatchNumber(0)));
+            assert_eq!(sequencer.published_head().await.unwrap(), None);
+            assert_eq!(sequencer.head().await.unwrap(), None);
+            assert_eq!(
+                sequencer.status(BatchNumber(0)).await.unwrap(),
+                Some(BatchStatus::Archived)
+            );
+            assert_eq!(
+                sequencer.unpublished_archived_batches().await.unwrap(),
+                vec![BatchNumber(0)]
+            );
+        });
+    }
+
+    #[test]
+    fn publish_archived_sequence_is_idempotent() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let context = Arc::new(context);
+            let backend = MockBackend::new();
+            let sequencer = SingleSequencer::from_shared(
+                context.clone(),
+                Publisher::from_shared(context.clone(), backend.clone(), publisher_config()),
+                Reader::from_shared(context, backend, reader_config()),
+                sequencer_config(),
+                TestApp::default(),
+            );
+
+            sequencer.submit(1).await.unwrap();
+            sequencer.submit(2).await.unwrap();
+            sequencer.archive_ready().await.unwrap().unwrap();
+
+            let first = sequencer
+                .publish_archived_sequence(BatchNumber(0))
+                .await
+                .unwrap()
+                .unwrap();
+            let second = sequencer
+                .publish_archived_sequence(BatchNumber(0))
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(first, second);
+            assert_eq!(sequencer.published_head().await.unwrap(), Some(BatchNumber(0)));
+            assert_eq!(
+                sequencer.unpublished_archived_batches().await.unwrap(),
+                Vec::new()
+            );
+            assert_eq!(
+                sequencer.status(BatchNumber(0)).await.unwrap(),
+                Some(BatchStatus::Published(first))
+            );
+        });
+    }
+
+    #[test]
+    fn record_published_cursor_accepts_external_publication() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let context = Arc::new(context);
+            let backend = MockBackend::new();
+            let sequencer = SingleSequencer::from_shared(
+                context.clone(),
+                Publisher::from_shared(context.clone(), backend.clone(), publisher_config()),
+                Reader::from_shared(context, backend, reader_config()),
+                sequencer_config(),
+                TestApp::default(),
+            );
+
+            sequencer.submit(1).await.unwrap();
+            sequencer.submit(2).await.unwrap();
+            let archived = sequencer.archive_ready().await.unwrap().unwrap();
+            let cursor = BatchCursor {
+                sequence: archived.sequence,
+                blob_ref: BlobRef {
+                    height: 42,
+                    namespace: namespace(),
+                    commitment: BlobCommitment([7; 32]),
+                },
+                payload_hash: archived.payload_hash,
+            };
+
+            assert_eq!(
+                sequencer.record_published_cursor(cursor.clone()).await.unwrap(),
+                Some(cursor.clone())
+            );
+            assert_eq!(
+                sequencer.record_published_cursor(cursor.clone()).await.unwrap(),
+                Some(cursor.clone())
+            );
+            assert_eq!(sequencer.published_head().await.unwrap(), Some(BatchNumber(0)));
+            assert_eq!(
+                sequencer.status(BatchNumber(0)).await.unwrap(),
+                Some(BatchStatus::Published(cursor))
+            );
+            assert_eq!(
+                sequencer.unpublished_archived_batches().await.unwrap(),
+                Vec::new()
+            );
         });
     }
 
