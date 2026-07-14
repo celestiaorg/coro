@@ -64,8 +64,19 @@ impl Backend for CelestiaClientBackend {
             .broadcast_blobs(&[blob], tx_config)
             .await
             .map_err(|err| Error::CelestiaSubmit(err.to_string()))?;
+        // Validate the node-returned transaction hash length before copying it into a
+        // fixed 32-byte array. `copy_from_slice` panics on any length mismatch, and the
+        // hash comes straight from the (untrusted) gRPC endpoint: a `code = 0` response
+        // with an empty or short `txhash` would otherwise crash the process here.
+        let hash_ref = submitted_tx.tx_ref().hash.as_ref();
+        if hash_ref.len() != 32 {
+            return Err(Error::CelestiaSubmit(format!(
+                "node returned a transaction hash of {} bytes, expected 32",
+                hash_ref.len()
+            )));
+        }
         let mut tx_hash = [0u8; 32];
-        tx_hash.copy_from_slice(submitted_tx.tx_ref().hash.as_ref());
+        tx_hash.copy_from_slice(hash_ref);
         Ok(BroadcastedSubmission {
             tx_hash,
             tx_bytes: Bytes::from(submitted_tx.tx_ref().tx.clone()),
@@ -159,16 +170,33 @@ impl Backend for CelestiaClientBackend {
                 let Some(index) = blob.index else {
                     return Err(Error::InclusionVerificationFailed);
                 };
+                // `index` and `shares_len` are derived from the node-supplied blob, so
+                // compute the range end with `checked_add` instead of `+`: a crafted
+                // response could otherwise overflow the `u64` (panicking in debug builds,
+                // wrapping to a bogus range in release) before the range is even fetched.
+                let range_end = index
+                    .checked_add(blob.shares_len() as u64)
+                    .ok_or(Error::InclusionVerificationFailed)?;
                 let shares = self
                     .client
                     .share()
-                    .get_range(blob_ref.height, index, index + blob.shares_len() as u64)
+                    .get_range(blob_ref.height, index, range_end)
                     .await
                     .map_err(|err| Error::CelestiaRead(err.to_string()))?;
-                shares
-                    .proof
-                    .verify(header.dah.hash())
-                    .map_err(|_| Error::InclusionVerificationFailed)?;
+                // Contain panics from the untrusted NMT proof verifier. nmt-rs 0.2.5
+                // panics (rather than returning `Err`) when a proof carries out-of-order
+                // namespace siblings, so a malicious `share.GetRange` response could crash
+                // the process here before the recomputed root is ever compared to the
+                // trusted DAH root. `catch_unwind` converts that panic into the same
+                // `InclusionVerificationFailed` a well-formed rejection produces, which
+                // preserves `ProofRequired` semantics (malformed proof -> error, not crash).
+                let dah_hash = header.dah.hash();
+                let proof = shares.proof.clone();
+                let verify_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    move || proof.verify(dah_hash),
+                ))
+                .map_err(|_| Error::InclusionVerificationFailed)?;
+                verify_result.map_err(|_| Error::InclusionVerificationFailed)?;
                 let reconstructed = CelestiaBlob::reconstruct(shares.shares.iter())
                 .map_err(|_| Error::InclusionVerificationFailed)?;
                 reconstructed
