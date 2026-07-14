@@ -1,3 +1,6 @@
+> [!IMPORTANT] 
+> This codebase has not been audited and is not intended for use in production, use at your own risk
+
 # coro
 
 `coro` is a Commonware-native Celestia data availability library with a minimal
